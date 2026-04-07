@@ -1,0 +1,176 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                    FRONTEND FIX - QUICK STEPS                                  ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+PROBLEM FOUND:
+──────────────
+Frontend (React) was connecting to WRONG PORT
+  ❌ Old: http://72.60.99.90:3015/
+  ✅ New: http://localhost:5003  (or your backend IP)
+
+BACKEND is on port 5003, not 3015!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 1: Find Your Backend IP
+──────────────────────────────
+
+Windows Command Prompt:
+  ipconfig
+
+Look for: "IPv4 Address"
+Example: 192.168.1.100
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 2: Update App.js
+──────────────────────
+
+File: new_react/react/src/App.js
+Line: 8
+
+Change this:
+  ┌─────────────────────────────────────────────┐
+  │ const BACKEND_URL = 'http://localhost:5003';│
+  └─────────────────────────────────────────────┘
+
+To your backend IP (choose one):
+
+  Local machine:
+    const BACKEND_URL = 'http://localhost:5003';
+
+  Same network (replace 192.168.1.100 with your IP):
+    const BACKEND_URL = 'http://192.168.1.100:5003';
+
+  External/Cloud server:
+    const BACKEND_URL = 'http://72.60.99.90:5003';
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 3: Restart React Server
+─────────────────────────────
+
+In your React project folder:
+
+  npm start
+
+Or if using yarn:
+
+  yarn start
+
+Server will restart and connect to backend on port 5003.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 4: Verify Connection
+──────────────────────────
+
+Open React app in browser:
+  Usually: http://localhost:3000
+
+Press F12 (Developer Tools)
+Go to: Console tab
+
+Look for these messages:
+  ✅ "Socket connected" or similar
+  ❌ No error messages about connection
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 5: Test with Backend Running
+──────────────────────────────────
+
+Terminal 1 - Backend:
+  cd "c:\Users\Admin\Desktop\MOTM Diagnose\Snov Tool\updated_snov\new_flask"
+  python finalcode.py
+
+Terminal 2 - React:
+  npm start
+
+When both are running, you should see:
+
+Backend Console:
+  → SocketIO async_mode = threading
+  [running on 0.0.0.0:5003]
+
+Browser Console (F12):
+  No connection errors
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 6: Run a Test Extraction
+──────────────────────────────
+
+1. In React UI, fill in a domain
+2. Click "Extract" or "Start Processing"
+3. You should see:
+
+   ✅ Activity Log showing progress:
+      "tatamotors.com: Domain processing started"
+      "tatamotors.com: Processing designation: manager"
+      "tatamotors.com: EMAIL FOUND - john@tatamotors.com"
+
+   ✅ Statistics updating:
+      Processed: 1/5
+      Remaining: 4
+
+   ✅ Preview Data table filling with emails:
+      | First Name | Job Title | Company | Email | Domain |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IF SOMETHING GOES WRONG:
+───────────────────────
+
+1. Check backend is running on port 5003
+   - Should see: "→ SocketIO async_mode = threading"
+
+2. Check frontend can reach backend
+   - Browser F12 → Network tab
+   - Look for polling requests to port 5003
+
+3. Check App.js has correct IP/port
+   - Line 8 should have BACKEND_URL with port 5003
+
+4. Restart both servers
+   - Kill React (Ctrl+C)
+   - Kill Backend (Ctrl+C)
+   - Start backend first
+   - Then start React
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+REFERENCE:
+──────────
+
+Backend port:  5003 (Flask-SocketIO)
+Frontend port: 3000 (React dev server, usually)
+Protocol:      HTTP with WebSocket polling
+File to edit:  new_react/react/src/App.js
+Line to edit:  8
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT YOU'LL SEE AFTER FIX:
+──────────────────────────
+
+Before (❌):
+  "No updates yet. Start extraction to see progress...."
+  Empty preview table
+
+After (✅):
+  Activity Log:
+    "tatamotors.com: Domain processing started"
+    "tatamotors.com: EMAIL FOUND - user@domain.com"
+
+  Stats:
+    Total: 5
+    Processed: 3
+    Remaining: 2
+
+  Preview Table:
+    Filled with extracted emails and data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ready? Follow the steps above! 🚀
