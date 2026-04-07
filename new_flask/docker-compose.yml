@@ -3,7 +3,7 @@ version: "3.8"
 services:
   snov-tool:
     build: .
-    container_name: new_snov
+    container_name: backsnow
     ports:
       - "3017:3017"   # Flask/Gunicorn — must be open in Hostinger VPS firewall
     environment:

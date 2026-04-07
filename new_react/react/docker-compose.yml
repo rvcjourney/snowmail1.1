@@ -7,7 +7,7 @@ services:
       args:
         # This is passed INTO the npm run build stage — change IP to your Hostinger VPS IP
         REACT_APP_BACKEND_URL: http://72.60.99.90:3017
-    container_name: react_app_new_8083
+    container_name: frontsnow
     ports:
       - "8083:80"
     restart: unless-stopped
