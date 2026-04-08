@@ -1,4 +1,5 @@
 version: "3.8"
+name: snov-backend
 
 services:
   snov-tool:

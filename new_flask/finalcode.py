@@ -500,6 +500,13 @@ async def handle_one_job(
 
         async def _async_wait_button_status_saved(row_el_h: ElementHandle, current_state, current_domain, current_title, timeout_s=25, poll_s=0.5):
             end_t = time.monotonic() + timeout_s
+            # Flexible selectors for the action button — covers both old and new Snov UI
+            action_btn_selectors = [
+                'css=td.row__cell--action button[class*="pl-select__top-target"]',
+                'css=td.row__cell--action button[class*="snv-btn"]',
+                'css=td.row__cell--action button',
+                'css=td[class*="action"] button',
+            ]
             while time.monotonic() < end_t:
                 await check_cancel(current_state, f"btn saved status {current_domain}/{current_title}")
                 try:
@@ -507,18 +514,19 @@ async def handle_one_job(
                         await asyncio.sleep(poll_s); continue
                 except Exception:
                     raise PlaywrightTimeoutError("Row element became stale while waiting for 'Saved' status.")
-                span_el = await row_el_h.query_selector('css=td.row__cell--action .snv-btn.snv-btn--with-icon.snv-btn--with-icon-left.snv-btn--secondary.pl-select__top-target')
-                if span_el:
+                for btn_sel in action_btn_selectors:
                     try:
-                        content_span = await span_el.query_selector("css=.pl-select__top-target-content span")
-                        if content_span:
-                            span_text = (await content_span.inner_text()).strip()
-                            if span_text == "Saved":
+                        btn_el = await row_el_h.query_selector(btn_sel)
+                        if btn_el:
+                            full_text = (await btn_el.inner_text()).strip()
+                            if "saved" in full_text.lower():
                                 return "Saved"
                     except Exception:
-                        pass
+                        continue
                 await asyncio.sleep(poll_s)
-            raise PlaywrightTimeoutError("Button status did not become 'Saved'.")
+            # Don't raise — just return a warning so the flow continues
+            print(f"[{sid}] Warning: 'Saved' status not confirmed within {timeout_s}s — continuing anyway.")
+            return "Unknown"
 
         async def _async_check_tick_mark_in_dropdown_item(dd_item_el_h: ElementHandle):
             if not dd_item_el_h: return False
@@ -897,22 +905,22 @@ async def handle_one_job(
                     location_from_row = "N/A"
                     try:
                         name_el = await current_row_el_handle.query_selector(
-                            "css=td.row__cell--first-name, css=td[class*='first-name']")
+                            "td.row__cell--first-name, td[class*='first-name']")
                         if name_el:
                             name_from_row = (await name_el.inner_text()).strip() or "N/A"
 
                         title_el = await current_row_el_handle.query_selector(
-                            "css=td.row__cell--name > div, css=td[class*='title'] div, css=td[class*='name'] div")
+                            "td.row__cell--name > div, td[class*='title'] div, td[class*='name'] div")
                         if title_el:
                             jobtitle_from_row = (await title_el.inner_text()).strip() or "N/A"
 
                         company_el = await current_row_el_handle.query_selector(
-                            "css=td.row__cell--company, css=td[class*='company']")
+                            "td.row__cell--company, td[class*='company']")
                         if company_el:
                             company_from_row = (await company_el.inner_text()).strip() or "N/A"
 
                         location_el = await current_row_el_handle.query_selector(
-                            "css=td.row__cell--location, css=td[class*='location']")
+                            "td.row__cell--location, td[class*='location']")
                         if location_el:
                             location_from_row = (await location_el.inner_text()).strip() or "N/A"
                     except Exception as e_extract_info:
@@ -943,7 +951,7 @@ async def handle_one_job(
 
                         initial_email_cell_text = (await email_cell_el_h_current.inner_text()).strip()
                         # More robust check for green/yellow status
-                        gy_selector = "css=span.email-status-1, span.email-status-2"
+                        gy_selector = "css=span.email-status-1, span.email-status-2, span[class*='email-status-1'], span[class*='email-status-2'], span[class*='status--green'], span[class*='status--yellow'], span[class*='verified']"
                         is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
                        
                         if is_green_or_yellow_email_row and "@" in initial_email_cell_text and "." in initial_email_cell_text \
@@ -973,18 +981,41 @@ async def handle_one_job(
                                     saved_btn_el_h = await find_element_flexible(action_cell_el_h, saved_btn_selectors)
 
                                 if saved_btn_el_h:
-                                    try: 
-                                        await page.evaluate("el => el.click()", saved_btn_el_h) # Click 'Saved' to open dropdown
-                                        await asyncio.sleep(0.7) # Wait for dropdown
-                                        
-                                        
-                                        dropdown_items_list_h = await page.query_selector_all("css=li.pl-select__item")
+                                    try:
+                                        # Use native Playwright click — Vue.js ignores plain JS el.click()
+                                        try:
+                                            await saved_btn_el_h.scroll_into_view_if_needed()
+                                            await saved_btn_el_h.click(timeout=5000)
+                                        except Exception:
+                                            await page.evaluate(
+                                                """el => {
+                                                    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                                        el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                                    );
+                                                }""",
+                                                saved_btn_el_h
+                                            )  # Click 'Saved' to open dropdown
+
+                                        # Wait for dropdown to appear
+                                        dropdown_items_list_h = []
+                                        for dd_sel in ["css=li.pl-select__item", "css=div.app-dropdown__drop li", "css=div.snov-dropdown__options li", "css=ul.pl-select__list li"]:
+                                            try:
+                                                await page.wait_for_selector(dd_sel, state="visible", timeout=5_000)
+                                                dropdown_items_list_h = await page.query_selector_all(dd_sel)
+                                                if dropdown_items_list_h:
+                                                    break
+                                            except PlaywrightTimeoutError:
+                                                continue
+
                                         is_already_ticked_in_list = False
-                                        
+
                                         if dropdown_items_list_h:
                                             for dd_item_h in dropdown_items_list_h:
-                                                item_name_span = await dd_item_h.query_selector("css=span.pl-select__item-name")
-                                                item_text = (await item_name_span.inner_text()).strip() if item_name_span else ""
+                                                item_name_span = await dd_item_h.query_selector(
+                                                    "span.pl-select__item-name, span.item-name, span"
+                                                )
+                                                item_text = (await item_name_span.inner_text()).strip() if item_name_span else \
+                                                            (await dd_item_h.inner_text()).strip()
                                                 if item_text.lower() == downloadFileName.strip().lower():
                                                     if await _async_check_tick_mark_in_dropdown_item(dd_item_h):
                                                         is_already_ticked_in_list = True
@@ -993,8 +1024,19 @@ async def handle_one_job(
                                                         final_email_str_from_row = None # Nullify to prevent re-adding
                                                     else: # Not ticked, so tick it
                                                         print(f"[{sid}]     Saving to target list '{downloadFileName}' (from Saved dropdown).")
-                                                        await page.evaluate("el => el.click()", dd_item_h)
-                                                        await asyncio.sleep(0.3)
+                                                        try:
+                                                            await dd_item_h.scroll_into_view_if_needed()
+                                                            await dd_item_h.click(timeout=5000)
+                                                        except Exception:
+                                                            await page.evaluate(
+                                                                """el => {
+                                                                    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                                                        el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                                                    );
+                                                                }""",
+                                                                dd_item_h
+                                                            )
+                                                        await asyncio.sleep(1.0)
                                                         # Wait for toast confirmation (optional but good)
                                                         try:
                                                             toast_selector = "xpath=//div[contains(text(), 'prospects saved') or contains(text(), 'Prospects have been saved')]"
@@ -1002,9 +1044,9 @@ async def handle_one_job(
                                                             await page.wait_for_selector(toast_selector, state="hidden", timeout=7_000)
                                                         except PlaywrightTimeoutError: print(f"[{sid}]     'Prospects saved' toast confirmation timeout.")
                                                     break # Found target list item
-                                            if not is_already_ticked_in_list and final_email_str_from_row is None and not any((await item.query_selector("css=span.pl-select__item-name") and await (await item.query_selector("css=span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
+                                            if not is_already_ticked_in_list and final_email_str_from_row is None and not any((await item.query_selector("span.pl-select__item-name") and await (await item.query_selector("span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
                                                  print(f"[{sid}]     ERROR: Target list '{downloadFileName}' NOT FOUND in dropdown (direct G/Y path).")
-                                            elif final_email_str_from_row and not any((await item.query_selector("css=span.pl-select__item-name") and await (await item.query_selector("css=span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
+                                            elif final_email_str_from_row and not any((await item.query_selector("span.pl-select__item-name") and await (await item.query_selector("span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
                                                 print(f"[{sid}]     WARN: Email found, but target list '{downloadFileName}' not in dropdown. Not saving to list.")
                                         else: print(f"[{sid}]     ERROR: Dropdown for list selection not found (direct G/Y path).")
                                         await page.keyboard.press("Escape") # Close dropdown
@@ -1038,37 +1080,99 @@ async def handle_one_job(
                             if add_list_btn_el_h:
                                 print(f"[{sid}]     'Add to list' button identified.")
                                 try:
-                                    await page.evaluate("el => el.click()", add_list_btn_el_h)
-                                    await asyncio.sleep(0.7) # Wait for dropdown
-                                    dropdown_items_list_h_add = await page.query_selector_all("css=li.pl-select__item")
+                                    # Use native Playwright click — Vue.js ignores plain JS el.click()
+                                    try:
+                                        await add_list_btn_el_h.scroll_into_view_if_needed()
+                                        await add_list_btn_el_h.click(timeout=5000)
+                                    except Exception:
+                                        await page.evaluate(
+                                            """el => {
+                                                ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                                    el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                                );
+                                            }""",
+                                            add_list_btn_el_h
+                                        )
+
+                                    # Wait for dropdown container to appear — don't rely on bare sleep
+                                    dropdown_container_selectors = [
+                                        "css=li.pl-select__item",
+                                        "css=div.app-dropdown__drop li",
+                                        "css=div.snov-dropdown__options li",
+                                        "css=ul.pl-select__list li",
+                                    ]
+                                    dropdown_items_list_h_add = []
+                                    for dd_sel in dropdown_container_selectors:
+                                        try:
+                                            await page.wait_for_selector(dd_sel, state="visible", timeout=5_000)
+                                            dropdown_items_list_h_add = await page.query_selector_all(dd_sel)
+                                            if dropdown_items_list_h_add:
+                                                print(f"[{sid}]     Dropdown found via: {dd_sel} ({len(dropdown_items_list_h_add)} items)")
+                                                break
+                                        except PlaywrightTimeoutError:
+                                            continue
+
                                     clicked_target_list_dd_item_add = False
-                                    
+
                                     if dropdown_items_list_h_add:
+                                        target_lower = downloadFileName.strip().lower()
                                         for dd_item_h_add in dropdown_items_list_h_add:
-                                            item_name_span = await dd_item_h_add.query_selector("css=span.pl-select__item-name")
-                                            item_text = (await item_name_span.inner_text()).strip() if item_name_span else ""
-                                            if item_text.lower() == downloadFileName.strip().lower():
-                                                print(f"[{sid}]     Found target list '{downloadFileName}' in dropdown. Clicking.")
-                                                await page.evaluate("el => el.click()", dd_item_h_add)
+                                            # Try multiple selectors for the item name span
+                                            item_name_span = await dd_item_h_add.query_selector(
+                                                "span.pl-select__item-name, span.item-name, span"
+                                            )
+                                            item_text = (await item_name_span.inner_text()).strip() if item_name_span else \
+                                                        (await dd_item_h_add.inner_text()).strip()
+                                            print(f"[{sid}]     Dropdown item: '{item_text}'")
+                                            if item_text.lower() == target_lower:
+                                                print(f"[{sid}]     Found target list '{downloadFileName}'. Clicking.")
+                                                # Dispatch full mouse event chain — Vue.js needs pointerdown/mousedown/mouseup/click
+                                                try:
+                                                    await dd_item_h_add.scroll_into_view_if_needed()
+                                                    await dd_item_h_add.click(timeout=5000)
+                                                except Exception:
+                                                    await page.evaluate(
+                                                        """el => {
+                                                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                                                el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                                            );
+                                                        }""",
+                                                        dd_item_h_add
+                                                    )
                                                 clicked_target_list_dd_item_add = True
-                                                await asyncio.sleep(0.2)
+                                                # Wait for toast confirmation that prospect was saved
+                                                try:
+                                                    toast_sel = "xpath=//div[contains(text(), 'prospects saved') or contains(text(), 'Prospects have been saved') or contains(text(), 'saved to')]"
+                                                    await page.wait_for_selector(toast_sel, state="visible", timeout=7_000)
+                                                    await page.wait_for_selector(toast_sel, state="hidden", timeout=7_000)
+                                                    print(f"[{sid}]     Toast confirmed: prospect saved to list.")
+                                                except PlaywrightTimeoutError:
+                                                    print(f"[{sid}]     No toast seen — proceeding anyway.")
+                                                await asyncio.sleep(0.5)
                                                 break
                                         if not clicked_target_list_dd_item_add:
                                             print(f"[{sid}]     ERROR: Target list '{downloadFileName}' not found in dropdown ('Add to list' path).")
-                                    else: print(f"[{sid}]     ERROR: Dropdown for list selection not found ('Add to list' path).")
+                                            print(f"[{sid}]     Available lists: {[((await i.query_selector('span.pl-select__item-name, span')) and (await (await i.query_selector('span.pl-select__item-name, span')).inner_text()).strip()) for i in dropdown_items_list_h_add]}")
+                                    else:
+                                        print(f"[{sid}]     ERROR: Dropdown did not appear after clicking 'Add to list'.")
 
                                     if clicked_target_list_dd_item_add:
                                         saved_status_text = await _async_wait_button_status_saved(current_row_el_handle, state, domain_str_item, title_str_item)
                                         stable_email_text_after_add = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item)
                                         print(f"[{sid}]     Status='{saved_status_text}', Final Email Text='{stable_email_text_after_add}'")
-                                        
-                                        is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector)) # Re-check status
-                                        if is_green_or_yellow_email_row and "@" in stable_email_text_after_add and "." in stable_email_text_after_add \
-                                           and "No email found" not in stable_email_text_after_add:
+
+                                        is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
+                                        # Accept email if: valid format AND (verified status OR save was confirmed)
+                                        email_is_valid_format = "@" in stable_email_text_after_add and "." in stable_email_text_after_add and "No email found" not in stable_email_text_after_add
+                                        if email_is_valid_format and (is_green_or_yellow_email_row or "saved" in saved_status_text.lower()):
                                             final_email_str_from_row = stable_email_text_after_add
                                             print(f"[{sid}]     Email successfully retrieved via 'Add to list': {final_email_str_from_row}")
+                                        elif email_is_valid_format:
+                                            # Email is valid but status uncertain — still record it
+                                            final_email_str_from_row = stable_email_text_after_add
+                                            print(f"[{sid}]     Email recorded (status uncertain but email valid): {final_email_str_from_row}")
                                         else:
-                                            print(f"[{sid}]     Email after 'Add to list' ('{stable_email_text_after_add}') not valid, not G/Y, or 'No email found'.")
+                                            print(f"[{sid}]     Email after 'Add to list' ('{stable_email_text_after_add}') not valid or 'No email found'.")
                                     else: # Target list not clicked
                                         if await page.query_selector("div.app-dropdown__drop, div.snov-dropdown__options"): # If dropdown is open
                                             await page.keyboard.press("Escape")
@@ -1081,12 +1185,12 @@ async def handle_one_job(
                                 
                                 stable_email_text_if_saved = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item, timeout_s=10) # Shorter timeout
                                 is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
-                                if is_green_or_yellow_email_row and "@" in stable_email_text_if_saved and "." in stable_email_text_if_saved \
-                                   and "No email found" not in stable_email_text_if_saved:
+                                email_valid = "@" in stable_email_text_if_saved and "." in stable_email_text_if_saved and "No email found" not in stable_email_text_if_saved
+                                if email_valid:
                                     final_email_str_from_row = stable_email_text_if_saved
-                                    print(f"[{sid}]     Email confirmed after re-checking 'Saved' row: {final_email_str_from_row}")
+                                    print(f"[{sid}]     Email confirmed from 'Saved' row: {final_email_str_from_row}")
                                 else:
-                                    print(f"[{sid}]   Button was 'Saved', but email text ('{stable_email_text_if_saved}') not G/Y or not found. Likely unverified or no email.")
+                                    print(f"[{sid}]   Button was 'Saved', but email text ('{stable_email_text_if_saved}') not valid or 'No email found'.")
                             else:
                                 print(f"[{sid}]   No 'Add to list' button found, or other state. Action cell: '{await action_cell_el_h.inner_text() if action_cell_el_h else 'N/A'}'")
 
@@ -1341,7 +1445,7 @@ def handle_process_data(payload):
 
         designations_payload = payload.get('designations', '')
         # downloadFileName is used for Snov list name, not actual file download here
-        downloadFileName_from_payload = payload.get('downloadFileName', 'Scraped_Prospects_List') 
+        downloadFileName_from_payload = payload.get('downloadFileName', '').strip() or 'Scraped_Prospects_List'
         
         designations_list_raw = [d.strip() for d in designations_payload.split(',') if d.strip()]
         
