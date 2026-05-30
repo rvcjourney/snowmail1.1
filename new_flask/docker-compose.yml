@@ -33,3 +33,6 @@ services:
 networks:
   snov-tool-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 10.200.0.0/24
