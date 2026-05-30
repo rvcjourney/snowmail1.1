@@ -1027,11 +1027,6 @@ async def handle_one_job(
                                 nf_rec = _not_found_record(not_found_record_id, domain_str_item, "Not found")
                                 file_data2.append(nf_rec)
                                 not_found_record_id += 1
-                                state["preview_list"].append(nf_rec)
-                                try:
-                                    socketio.emit("preview_data", {"previewData": state["preview_list"]}, room=sid)
-                                except Exception as e_emit_preview_final:
-                                    print(f"[{sid}] Error emitting preview data: {e_emit_preview_final}")
                         # Only continue if we actually confirmed no prospects (no table rows)
                         continue 
                 except MySpecialError: raise
@@ -1542,11 +1537,6 @@ async def handle_one_job(
                             "email": "Not found",
                             "domain": domain_str_item
                         }
-                        state["preview_list"].append(not_found_rec)
-                        try:
-                            socketio.emit("preview_data", {"previewData": state["preview_list"]}, room=sid)
-                        except Exception:
-                            pass
                         # Logic for file_data2 if last designation and no G/Y email from heap
                         if title_idx == len(designations) - 1 and not found_verified_email_domain: # Check found_verified_email_domain for G/Y specifically
                             # Check if this domain already has a "Not found" entry from this path
@@ -1555,17 +1545,12 @@ async def handle_one_job(
                                 heap_nf_rec = _not_found_record(not_found_record_id, domain_str_item, "Not found (heap path)")
                                 file_data2.append(heap_nf_rec)
                                 not_found_record_id += 1
-                                state["preview_list"].append(heap_nf_rec)
-                                try:
-                                    socketio.emit("preview_data", {"previewData": state["preview_list"]}, room=sid)
-                                except Exception as e_emit_preview_final:
-                                    print(f"[{sid}] Error emitting preview data: {e_emit_preview_final}")
                 
                 await check_cancel(state, f"Finished heap for {domain_str_item}/{title_str_item}")
                 print(f"[{sid}]\nFinished processing rows for title '{title_str_item}'. Total G/Y emails for this title run: {emails_collected_for_this_title_run}")
             
             # ── Fallback: domain-search generic contacts if quota not met ──
-            if num_results > 0:
+            if num_results > 0 and not found_flag_domain:
                 socketio.emit("progress_update", {"domain": domain_str_item, "message": f"Quota not met ({num_results} still needed). Trying generic-contact fallback..."}, room=sid)
                 fallback_records = await _async_domain_search_fallback(
                     page, domain_str_item, downloadFileName, num_results, state, sid
