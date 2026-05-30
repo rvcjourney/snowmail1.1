@@ -770,7 +770,7 @@ function FileUpload() {
                   </label>
                   <input
                     type="text"
-                    placeholder="New York, San Francisco"
+                    placeholder="pune, mumbai"
                     value={location}
                     onChange={(e) => setLocation(e.target.value)}
                     style={styles.input}
@@ -905,6 +905,8 @@ function FileUpload() {
                 </h2>
                 <p style={{color: '#7f8c8d', fontSize: '14px', margin: '8px 0 0 0'}}>
                   Total Records: <strong style={{color: '#3498db', fontSize: '16px'}}>{previewData.length}</strong>
+                  {' · '}
+                  Emails Found: <strong style={{color: '#27ae60', fontSize: '16px'}}>{previewData.filter(item => item.email && item.email.includes('@')).length}</strong>
                 </p>
               </div>
 
@@ -927,16 +929,19 @@ function FileUpload() {
                       </tr>
                     </thead>
                     <tbody>
-                      {previewData.map((item, index) => (
+                      {previewData.map((item, index) => {
+                        const hasEmail = item.email && item.email.includes('@');
+                        return (
                         <tr key={index}>
                           <td style={styles.tableCell}>{item['First Name'] || '-'}</td>
                           <td style={styles.tableCell}>{item['job title'] || '-'}</td>
                           <td style={styles.tableCell}>{item.company || '-'}</td>
                           <td style={styles.tableCell}>{item.location || '-'}</td>
-                          <td style={{...styles.tableCell, color: '#3498db', fontWeight: '600'}}>{item.email || '-'}</td>
+                          <td style={{...styles.tableCell, color: hasEmail ? '#27ae60' : '#e74c3c', fontWeight: '600'}}>{item.email || 'Not found'}</td>
                           <td style={styles.tableCell}>{item.domain || '-'}</td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

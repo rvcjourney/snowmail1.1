@@ -1008,6 +1008,7 @@ async def handle_one_job(
                                                 continue
 
                                         is_already_ticked_in_list = False
+                                        found_target_in_dropdown = False
 
                                         if dropdown_items_list_h:
                                             for dd_item_h in dropdown_items_list_h:
@@ -1017,6 +1018,7 @@ async def handle_one_job(
                                                 item_text = (await item_name_span.inner_text()).strip() if item_name_span else \
                                                             (await dd_item_h.inner_text()).strip()
                                                 if item_text.lower() == downloadFileName.strip().lower():
+                                                    found_target_in_dropdown = True
                                                     if await _async_check_tick_mark_in_dropdown_item(dd_item_h):
                                                         is_already_ticked_in_list = True
                                                         print(f"[{sid}]     Email already saved in target list '{downloadFileName}'.")
@@ -1037,18 +1039,21 @@ async def handle_one_job(
                                                                 dd_item_h
                                                             )
                                                         await asyncio.sleep(1.0)
-                                                        # Wait for toast confirmation (optional but good)
                                                         try:
-                                                            toast_selector = "xpath=//div[contains(text(), 'prospects saved') or contains(text(), 'Prospects have been saved')]"
+                                                            toast_selector = "xpath=//div[contains(text(), 'prospects saved') or contains(text(), 'Prospects have been saved') or contains(text(), 'saved to')]"
                                                             await page.wait_for_selector(toast_selector, state="visible", timeout=7_000)
                                                             await page.wait_for_selector(toast_selector, state="hidden", timeout=7_000)
-                                                        except PlaywrightTimeoutError: print(f"[{sid}]     'Prospects saved' toast confirmation timeout.")
+                                                        except PlaywrightTimeoutError:
+                                                            print(f"[{sid}]     'Prospects saved' toast not detected — continuing.")
                                                     break # Found target list item
-                                            if not is_already_ticked_in_list and final_email_str_from_row is None and not any((await item.query_selector("span.pl-select__item-name") and await (await item.query_selector("span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
-                                                 print(f"[{sid}]     ERROR: Target list '{downloadFileName}' NOT FOUND in dropdown (direct G/Y path).")
-                                            elif final_email_str_from_row and not any((await item.query_selector("span.pl-select__item-name") and await (await item.query_selector("span.pl-select__item-name")).inner_text()).strip().lower() == downloadFileName.strip().lower() for item in dropdown_items_list_h):
-                                                print(f"[{sid}]     WARN: Email found, but target list '{downloadFileName}' not in dropdown. Not saving to list.")
-                                        else: print(f"[{sid}]     ERROR: Dropdown for list selection not found (direct G/Y path).")
+                                            if not found_target_in_dropdown:
+                                                print(f"[{sid}]     ERROR: Target list '{downloadFileName}' NOT FOUND in dropdown (direct G/Y path).")
+                                            elif is_already_ticked_in_list:
+                                                pass  # Already logged above
+                                            elif final_email_str_from_row is None:
+                                                print(f"[{sid}]     WARN: Email nullified — not re-adding.")
+                                        else:
+                                            print(f"[{sid}]     ERROR: Dropdown for list selection not found (direct G/Y path).")
                                         await page.keyboard.press("Escape") # Close dropdown
                                         await asyncio.sleep(0.2)
                                     except Exception as e_click_saved_dd:
@@ -1238,6 +1243,20 @@ async def handle_one_job(
                     else:
                         invalid_email_count += 1
                         print(f"[{sid}]   No valid G/Y email found for this row after all attempts. Skipping record add.")
+                        # Emit this row to preview so the frontend can show "not found" prospects
+                        not_found_rec = {
+                            "First Name": name_from_row,
+                            "job title": jobtitle_from_row,
+                            "company": company_from_row,
+                            "location": location_from_row,
+                            "email": "Not found",
+                            "domain": domain_str_item
+                        }
+                        state["preview_list"].append(not_found_rec)
+                        try:
+                            socketio.emit("preview_data", {"previewData": state["preview_list"]}, room=sid)
+                        except Exception:
+                            pass
                         # Logic for file_data2 if last designation and no G/Y email from heap
                         if title_idx == len(designations) - 1 and not found_verified_email_domain: # Check found_verified_email_domain for G/Y specifically
                             # Check if this domain already has a "Not found" entry from this path
