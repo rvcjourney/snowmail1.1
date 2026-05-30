@@ -50,6 +50,45 @@ EMAIL_CELL_WAIT_TIMEOUT = 55
 BUTTON_STATUS_WAIT_TIMEOUT = 25
 INVALID_EMAIL_COUNT_THRESHOLD = 5
 EMAIL_STABILITY_CONF_TIME = 1.0
+GENERIC_EMAIL_PREFIXES = {"info", "response", "quality", "purchase", "procurement", "md", "ceo", "contact"}
+
+# ─────────────────── SHARED SELECTOR CONSTANTS ──────────────────
+DROPDOWN_ITEM_SELECTORS = [
+    "css=li.pl-select__item",
+    "css=div.app-dropdown__drop li",
+    "css=div.snov-dropdown__options li",
+    "css=ul.pl-select__list li",
+]
+ACTION_CELL_SELECTORS = [
+    "css=td.row__cell--action",
+    "css=td[class*='action']",
+    "xpath=.//td[contains(@class,'action')]",
+]
+EMAIL_CELL_SELECTORS = [
+    "css=td.row__cell--email",
+    "css=td[class*='email']",
+    "xpath=.//td[contains(@class,'email')]",
+]
+ROW_SELECTORS = [
+    "css=tbody tr.row",
+    "css=tbody tr",
+    "css=tr.row",
+    "xpath=//tbody/tr",
+]
+
+# Regex for extracting a valid email from cell text
+_EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+
+def _not_found_record(record_id: int, domain: str, reason: str = "Not found") -> dict:
+    """Single helper for all not-found email records."""
+    return {
+        "First Name": str(record_id),
+        "job title": "N/A",
+        "company": "N/A",
+        "location": "N/A",
+        "email": reason,
+        "domain": domain,
+    }
 
 class MySpecialError(Exception):
     """Raised when a special condition occurs or for cancellation."""
@@ -143,6 +182,278 @@ async def dismiss_onboarding_tooltip(page: Page):
     except Exception as e:
         print(f"⚠️ Could not dismiss onboarding tooltip: {e}")
         # Non-fatal; continue
+
+# ─────────────── HUMAN SIMULATION HELPERS ───────────────────────────────────
+
+async def human_delay(min_s: float = 0.4, max_s: float = 1.0):
+    """Random sleep that mimics human reaction / reading time."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+async def human_type(element, text: str):
+    """
+    Type text character-by-character with random per-keystroke delay.
+    More reliable with Vue v-model than a plain fill().
+    """
+    await element.click()
+    await element.fill("")
+    await asyncio.sleep(random.uniform(0.1, 0.25))
+    await element.type(str(text), delay=random.randint(40, 100))
+
+async def human_click(page: Page, element):
+    """
+    Hover over element → brief pause → click.
+    Falls back to full Vue-safe mouse event chain if Playwright click fails.
+    """
+    try:
+        await element.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    try:
+        await element.hover()
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        await element.click()
+    except Exception:
+        try:
+            el_h = (await element.element_handle()) if hasattr(element, "element_handle") else element
+            if el_h:
+                await page.evaluate(
+                    """el => {
+                        ['pointerover','pointerenter','mouseover','mouseenter',
+                         'pointermove','mousemove',
+                         'pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                        );
+                    }""",
+                    el_h
+                )
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _async_domain_search_fallback(
+    page: Page, domain: str, list_name: str,
+    needed: int, state: dict, sid: str
+) -> list:
+    """
+    Fallback: visit snov.io/domain-search, pull Generic Contact emails whose
+    prefix matches GENERIC_EMAIL_PREFIXES, save up to `needed` to `list_name`.
+    Returns list of email record dicts to be merged into file_data.
+    """
+    collected = []
+    try:
+        await check_cancel(state, f"domain-search fallback start for {domain}")
+        print(f"[{sid}] [FALLBACK] Navigating to domain-search for '{domain}' (need {needed} more email(s))...")
+        await page.goto("https://app.snov.io/domain-search")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except PlaywrightTimeoutError:
+            await asyncio.sleep(3)
+
+        # ── Type domain ──
+        search_input = page.locator('input[placeholder="Enter domain or company name..."]')
+        await search_input.wait_for(state="visible", timeout=10_000)
+        await search_input.fill(domain)
+        await asyncio.sleep(1.0)  # wait for autocomplete API to respond
+        await search_input.press("Enter")  # submit directly — no dropdown needed
+        print(f"[{sid}] [FALLBACK] Pressed Enter to search for '{domain}'.")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except PlaywrightTimeoutError:
+            await asyncio.sleep(3)
+
+        # ── Click Generic Contacts tab ──
+        await check_cancel(state, f"domain-search fallback tab click for {domain}")
+        generic_tab = page.locator("text=Generic Contacts")
+        await generic_tab.wait_for(state="visible", timeout=10_000)
+        await generic_tab.click()
+        await asyncio.sleep(2)
+        print(f"[{sid}] [FALLBACK] Generic Contacts tab opened.")
+
+        # ── Read email rows — find rows that have a "Save to list" button ──
+        rows = []
+        row_selectors_fb = [
+            "//tr[.//button[contains(text(),'Save to list') or contains(text(),'Save to List')]]",
+            "//tr[.//button[contains(text(),'Save')]]",
+            "//div[contains(@class,'service-emails')]//tr",
+            "//div[@data-tab='service']//tr",
+            "//div[contains(@class,'generic')]//tr",
+            "//tbody//tr[.//td]",
+        ]
+        for rs in row_selectors_fb:
+            try:
+                rows = await page.locator(rs).all()
+                if rows:
+                    print(f"[{sid}] [FALLBACK] Found {len(rows)} generic contact rows via: {rs}")
+                    break
+            except Exception:
+                continue
+        if not rows:
+            print(f"[{sid}] [FALLBACK] No generic contact rows found for '{domain}'.")
+
+        for row in rows:
+            if len(collected) >= needed:
+                break
+            await check_cancel(state, f"domain-search fallback row scan for {domain}")
+            try:
+                # Find email in any td that contains "@"
+                email_text = ""
+                all_tds = await row.locator("td").all()
+                for td in all_tds:
+                    try:
+                        td_txt = (await td.text_content() or "").strip().lower()
+                        if "@" in td_txt and "." in td_txt:
+                            email_text = td_txt
+                            break
+                    except Exception:
+                        continue
+                if not email_text:
+                    continue
+                prefix = email_text.split("@")[0]
+                if prefix not in GENERIC_EMAIL_PREFIXES:
+                    print(f"[{sid}] [FALLBACK] Skip (prefix '{prefix}' not allowed): {email_text}")
+                    continue
+
+                print(f"[{sid}] [FALLBACK] Match: {email_text} — saving to list '{list_name}'...")
+
+                # ── Click "Save to List" — use Vue-safe mouse event chain ──
+                save_btn_el = None
+                for save_btn_text in ["Save to List", "Save to list", "Save"]:
+                    try:
+                        candidate = await row.locator(f"button:has-text('{save_btn_text}')").element_handle(timeout=2_000)
+                        if candidate:
+                            save_btn_el = candidate
+                            break
+                    except Exception:
+                        continue
+                if not save_btn_el:
+                    # Last resort: any button in the row
+                    all_row_btns = await row.locator("button").all()
+                    for btn in all_row_btns:
+                        try:
+                            btn_txt = (await btn.inner_text()).strip().lower()
+                            if "save" in btn_txt or "list" in btn_txt:
+                                save_btn_el = await btn.element_handle()
+                                break
+                        except Exception:
+                            continue
+                if not save_btn_el:
+                    print(f"[{sid}] [FALLBACK] 'Save to List' button not found for {email_text}. Skipping.")
+                    continue
+                await save_btn_el.scroll_into_view_if_needed()
+                try:
+                    await save_btn_el.click(timeout=5_000)
+                except Exception:
+                    await page.evaluate(
+                        """el => {
+                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                            );
+                        }""",
+                        save_btn_el
+                    )
+
+                # ── Wait for dropdown list items to appear ──
+                dropdown_items_fb = []
+                item_selectors_fb = [
+                    "css=li.pl-select__item",
+                    "css=div.app-dropdown__drop li",
+                    "css=div.snov-dropdown__options li",
+                    "css=ul.pl-select__list li",
+                    "css=ul li",
+                ]
+                for dd_sel in item_selectors_fb:
+                    try:
+                        await page.wait_for_selector(dd_sel, state="visible", timeout=5_000)
+                        dropdown_items_fb = await page.query_selector_all(dd_sel)
+                        if dropdown_items_fb:
+                            print(f"[{sid}] [FALLBACK] Dropdown opened with {len(dropdown_items_fb)} item(s) via '{dd_sel}'.")
+                            break
+                    except PlaywrightTimeoutError:
+                        continue
+
+                if not dropdown_items_fb:
+                    # Second attempt: press Enter on button
+                    print(f"[{sid}] [FALLBACK] Dropdown not found for {email_text}. Trying Enter key...")
+                    try:
+                        await save_btn_el.focus()
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(0.5)
+                        for dd_sel in item_selectors_fb:
+                            try:
+                                await page.wait_for_selector(dd_sel, state="visible", timeout=4_000)
+                                dropdown_items_fb = await page.query_selector_all(dd_sel)
+                                if dropdown_items_fb:
+                                    break
+                            except PlaywrightTimeoutError:
+                                continue
+                    except Exception as e_enter:
+                        print(f"[{sid}] [FALLBACK] Enter key attempt failed: {e_enter}")
+
+                if not dropdown_items_fb:
+                    print(f"[{sid}] [FALLBACK] Still no dropdown items for {email_text}. Skipping.")
+                    await page.keyboard.press("Escape")
+                    continue
+
+                # ── Click matching list item — Vue-safe ──
+                list_clicked = False
+                target_lower_fb = list_name.strip().lower()
+                for dd_item_fb in dropdown_items_fb:
+                    try:
+                        span_fb = await dd_item_fb.query_selector("span.pl-select__item-name, span.item-name, span")
+                        item_txt_fb = (await span_fb.inner_text()).strip() if span_fb else (await dd_item_fb.inner_text()).strip()
+                        print(f"[{sid}] [FALLBACK] Dropdown item: '{item_txt_fb}'")
+                        if item_txt_fb.lower() == target_lower_fb:
+                            print(f"[{sid}] [FALLBACK] Found '{list_name}'. Clicking...")
+                            opt_el = dd_item_fb
+                            try:
+                                await opt_el.scroll_into_view_if_needed()
+                                await opt_el.click(timeout=3_000)
+                            except Exception:
+                                await page.evaluate(
+                                    """el => {
+                                        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                        );
+                                }""",
+                                    opt_el
+                                )
+                            list_clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not list_clicked:
+                    print(f"[{sid}] [FALLBACK] List '{list_name}' not found in dropdown for {email_text}. Pressing Escape.")
+                    await page.keyboard.press("Escape")
+                    continue
+
+                await asyncio.sleep(1)
+                await page.keyboard.press("Escape")  # close any residual dropdown
+                print(f"[{sid}] [FALLBACK] ✅ Saved {email_text} to list '{list_name}'.")
+                collected.append({
+                    "First Name": "N/A",
+                    "job title": "Generic Contact",
+                    "company": domain,
+                    "location": "N/A",
+                    "email": email_text,
+                    "domain": domain,
+                })
+
+            except MySpecialError:
+                raise
+            except Exception as e_row:
+                print(f"[{sid}] [FALLBACK] Row error: {e_row}")
+                continue
+
+    except MySpecialError:
+        raise
+    except Exception as e_fb:
+        print(f"[{sid}] [FALLBACK] Domain-search fallback failed for '{domain}': {e_fb}")
+
+    print(f"[{sid}] [FALLBACK] Collected {len(collected)} email(s) via fallback for '{domain}'.")
+    return collected
+
 
 # ───────────── 2) GLOBALS FOR THE PLAYWRIGHT WORKER ──────────────────────────
 playwright_job_queue = None     # Will be set to an asyncio.Queue() inside worker
@@ -366,27 +677,34 @@ async def handle_one_job(
 
         modal_title_loc = page.locator("div.modal-snovio__title", has_text="Create a new prospects list")
         await modal_title_loc.wait_for(state="visible", timeout=20_000)
-        
+
         name_input_modal_loc = page.locator("div.modal-snovio__window input.snov-input__input")
         await name_input_modal_loc.wait_for(state="visible", timeout=20_000)
-        await name_input_modal_loc.fill(str(downloadFileName)) 
-        await asyncio.sleep(0.2)
+        await human_type(name_input_modal_loc, downloadFileName)
+        await human_delay(0.2, 0.5)
+        print(f"[{sid}] Typed list name: '{downloadFileName}'")
 
         await page.wait_for_selector("button[data-test='snov-modal-btn-primary']", state="attached", timeout=20_000)
-        create_btn_modal_loc = page.locator("button[data-test='snov-modal-btn-primary']", has_text="Create")
-        create_btn_el_handle = await create_btn_modal_loc.element_handle(timeout=5000) 
-        if not create_btn_el_handle or not await create_btn_el_handle.is_visible():
-            candidate_btns = await page.query_selector_all("button[data-test='snov-modal-btn-primary']")
-            found_create_btn_handle = None
-            for btn_h in candidate_btns:
-                if await btn_h.is_visible() and (await btn_h.inner_text()).strip() == "Create":
-                    found_create_btn_handle = btn_h; break
-            if not found_create_btn_handle: raise MySpecialError("Could not find visible Create button in modal (Playwright)")
-            create_btn_el_handle = found_create_btn_handle
-        
-        await create_btn_el_handle.scroll_into_view_if_needed()
-        await page.evaluate("el => el.click()", create_btn_el_handle) # Use evaluate for tricky clicks
-        await page.wait_for_selector("div.modal-snovio__window", state="hidden", timeout=10_000)
+        create_btn_loc = page.locator("button[data-test='snov-modal-btn-primary']", has_text="Create")
+        await human_click(page, create_btn_loc)
+
+        # Wait for modal to close — if it stays open, list name likely already exists
+        try:
+            await page.wait_for_selector("div.modal-snovio__window", state="hidden", timeout=10_000)
+            print(f"[{sid}] ✅ List '{downloadFileName}' created successfully.")
+        except PlaywrightTimeoutError:
+            # Modal still open — check for duplicate-name error and close modal gracefully
+            error_el = await page.query_selector("div.snov-input__error, div.modal-snovio__error, span.error")
+            error_text = (await error_el.inner_text()).strip() if error_el else "unknown"
+            print(f"[{sid}] ⚠️ Modal did not close after Create. Error: '{error_text}'. List '{downloadFileName}' may already exist — proceeding with it.")
+            # Close the modal so the job can continue
+            try:
+                close_btn = page.locator("div.modal-snovio__close, button[aria-label='Close'], .modal-snovio__close-btn")
+                await close_btn.first.click(timeout=3_000)
+            except Exception:
+                await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+
         await check_cancel(state, "Created list")
 
         await page.goto("https://app.snov.io/database-search/prospects")
@@ -438,7 +756,7 @@ async def handle_one_job(
 
         # ── Helper functions defined once, shared across all domain/designation iterations ──
 
-        async def _async_wait_all_email_cells_final(pg_handle: Page, current_state, current_domain, current_title, timeout_seconds=30.0):
+        async def _async_wait_all_email_cells_final(pg_handle: Page, current_state, current_domain, current_title, timeout_seconds=55.0):
             start_time_sec = time.monotonic()
             print(f"[{sid}] Waiting for email cells to stabilize for {current_domain}/{current_title}...")
             while time.monotonic() - start_time_sec < timeout_seconds:
@@ -457,7 +775,7 @@ async def handle_one_job(
                             "@" in text_in_cell or
                             "No email found" in text_in_cell or
                             "Click Add to list to initiate email search" in text_in_cell or
-                            (text_in_cell == "" and await r_el_h.query_selector("css=td.row__cell--action button span:has-text('Add to list')"))
+                            text_in_cell == ""  # empty cell = Vue hasn't rendered yet; per-row will handle
                         )
                         if not is_final_state:
                             all_cells_are_final = False; break
@@ -468,8 +786,10 @@ async def handle_one_job(
                     print(f"[{sid}] All email cells stable for {current_domain}/{current_title}.")
                     return True
                 await asyncio.sleep(0.5)
-            print(f"[{sid}] Timed out waiting for email cells to stabilize for {current_domain}/{current_title}.")
-            return False
+            # Timeout — continue anyway with whatever cells have loaded
+            elapsed = time.monotonic() - start_time_sec
+            print(f"[{sid}] Email cells did not fully stabilize after {elapsed:.0f}s for {current_domain}/{current_title}. Proceeding with available rows.")
+            return True
 
         async def _async_wait_stable_email_text_in_cell(email_cell_h: ElementHandle, current_state, current_domain, current_title, timeout_s=55, poll_s=0.5):
             end_t = time.monotonic() + timeout_s; last_t = None; stable_st = None; conf_t = 1.0
@@ -554,7 +874,6 @@ async def handle_one_job(
                 {"total": total_domains, "processed": processed_count, "remaining": remaining_calc},
                 room=sid,
             )
-            await asyncio.sleep(0.01) # Miniscule sleep just to ensure emit goes
             print(f"[{sid}] Processing domain: {domain_str_item}")
             socketio.emit(
                 "progress_update",
@@ -591,50 +910,16 @@ async def handle_one_job(
                 company_name_input_el = await page.wait_for_selector(
                     company_name_input_xpath_pd, state="visible", timeout=20_000
                 )
-                try: await company_name_input_el.click(timeout=3000)
-                except PlaywrightTimeoutError: await page.evaluate("el => el.click()", company_name_input_el)
-                
-                await company_name_input_el.fill(domain_str_item)
+                await human_type(company_name_input_el, domain_str_item)
                 print(f"[{sid}] Entered '{domain_str_item}' into company name input.")
+                await human_delay(0.4, 0.8)
 
-                # Wait for suggestions to appear; the locator might need to be more robust
-                # Snov.io might have dynamic loading, so ensure the specific suggestion is loaded
-
-                # first_sugg_el = await page.wait_for_selector(
-                #     first_suggestion_locator_xpath_pd, state="visible", timeout=20_000 
-                # )
-
-                ########## change1
-                # company_xpath = first_suggestion_locator_xpath_pd.format(
-                #     domain=domain_str_item
-                # )
-
-                # first_sugg_el = await page.wait_for_selector(
-                #     company_xpath,
-                #     state="visible",
-                #     timeout=7000
-                # )
-                # await first_sugg_el.click()
-
-                company_xpath = first_suggestion_locator_xpath_pd.format(
-                    domain=domain_str_item
-                )
-
-                # Wait until suggestion exists in DOM
+                company_xpath = first_suggestion_locator_xpath_pd.format(domain=domain_str_item)
                 await page.wait_for_selector(company_xpath, state="attached", timeout=10_000)
-
-                # Click using selector (NOT ElementHandle)
+                await human_delay(0.2, 0.4)
                 await page.click(company_xpath, timeout=10_000)
 
                 print(f"[{sid}] Clicked first company suggestion for '{domain_str_item}'.")
-
-                ##### Change2
-                # try: await first_sugg_el.click(timeout=30_000) # Increased timeout for click
-                # except PlaywrightTimeoutError: await page.evaluate("el => el.click()", first_sugg_el)
-                # print(f"[{sid}] Clicked first company suggestion for '{domain_str_item}'.")
-                # await check_cancel(state, f"Selected company suggestion for {domain_str_item}")
-                # await asyncio.sleep(0.5) # Allow UI to update
-
                 await check_cancel(state, f"Selected company suggestion for {domain_str_item}")
                 await asyncio.sleep(0.5)  # Allow UI to update
 
@@ -652,10 +937,7 @@ async def handle_one_job(
                 print(f"[{sid}] Error during search setup for domain '{domain_str_item}': {e_domain_setup}")
                 socketio.emit("progress_update", {"domain": domain_str_item, "message": "Domain not available in snov.io"}, room=sid)
                 #------------------------------------------
-                new_not_found_record = {
-                        "First Name": str(not_found_record_id), "job title": "N/A", "company": "N/A",
-                        "location": "N/A", "email": "Not found (domain level)", "domain": domain_str_item
-                }
+                new_not_found_record = _not_found_record(not_found_record_id, domain_str_item, "Not found (domain level)")
                 file_data2.append(new_not_found_record)
                 not_found_record_id += 1
                 state["preview_list"].append(new_not_found_record)
@@ -669,7 +951,6 @@ async def handle_one_job(
             for title_idx, title_str_item in enumerate(designations):
                 await check_cancel(state, f"Processing designation '{title_str_item}' for domain '{domain_str_item}'")
                 socketio.emit("progress_update", {"domain": domain_str_item, "message": f"Processing designation: {title_str_item}"}, room=sid)
-                await asyncio.sleep(0.01)
 
                 if num_results <= 0:
                     print(f"[{sid}] Domain email cap (num_results={num_results}) reached for '{domain_str_item}'. Skipping designation '{title_str_item}'.")
@@ -708,13 +989,14 @@ async def handle_one_job(
                     break
 
                 try:
-                    await job_title_filter_input_el.fill(title_str_item)
-                    await job_title_filter_input_el.press("Enter") # Ensure filter is applied
-                    await asyncio.sleep(0.2) # Allow filter to apply
+                    await human_type(job_title_filter_input_el, title_str_item)
+                    await human_delay(0.2, 0.4)
+                    await job_title_filter_input_el.press("Enter")
+                    await human_delay(0.3, 0.6)
 
-                    await company_domain_search_button_el.click()
+                    await human_click(page, company_domain_search_button_el)
                     print(f"[{sid}] Search initiated for domain: {domain_str_item}, title: {title_str_item}")
-                    await asyncio.sleep(0.8) # Wait for search results to begin loading
+                    await human_delay(0.6, 1.2)
                 except Exception as e_apply_filter_search:
                     print(f"[{sid}] Error applying filter or searching for title '{title_str_item}': {e_apply_filter_search}")
                     continue # Skip to next designation
@@ -742,10 +1024,7 @@ async def handle_one_job(
                         if title_idx == len(designations) - 1 and not found_flag_domain:
                             print(f"[{sid}] Last designation ('{title_str_item}') and no email found yet for domain '{domain_str_item}' (no prospects path). Adding to file_data2.")
                             if not any(item['domain'] == domain_str_item for item in file_data2):
-                                nf_rec = {
-                                    "First Name": str(not_found_record_id), "job title": "N/A", "company": "N/A",
-                                    "location": "N/A", "email": "Not found", "domain": domain_str_item
-                                }
+                                nf_rec = _not_found_record(not_found_record_id, domain_str_item, "Not found")
                                 file_data2.append(nf_rec)
                                 not_found_record_id += 1
                                 state["preview_list"].append(nf_rec)
@@ -763,35 +1042,22 @@ async def handle_one_job(
                     continue
 
                 try:
-                    # Wait for at least one table row to ensure results are loaded
-                    await page.wait_for_selector("css=tbody tr", state="attached", timeout=15_000)
+                    # Wait for content loader to clear, then wait for first table row
+                    try:
+                        await page.wait_for_selector(".snovContentLoader.snovContentLoader--full-screen", state="hidden", timeout=10_000)
+                    except PlaywrightTimeoutError:
+                        pass  # loader may not be present
+                    await page.wait_for_selector("css=tbody tr", state="attached", timeout=20_000)
                 except MySpecialError: raise
                 except PlaywrightTimeoutError:
-                    print(f"[{sid}] Timed out waiting for table rows for title '{title_str_item}'.")
-                    # Try alternative row selectors
+                    print(f"[{sid}] Timed out waiting for table rows for '{title_str_item}'. Retrying after 3s...")
+                    await asyncio.sleep(3)
                     try:
-                        alt_rows = await page.query_selector_all("tr.row, div[class*='table-row'], div[class*='prospect'], tr")
-                        print(f"[{sid}] ⚠️ Alternative row selectors found: {len(alt_rows)} rows total")
-
-                        if len(alt_rows) > 0:
-                            print(f"[{sid}] ✓ Using alternative row selector - found {len(alt_rows)} prospects")
-                        else:
-                            # Debug: Log page structure
-                            await page.screenshot(path=f"debug_page_{sid}.png")
-                            print(f"[{sid}] 📸 Screenshot saved to debug_page_{sid}.png")
-
-                            table_elements = await page.query_selector_all("table, [role='grid'], [role='table'], div[class*='list'], div[class*='table']")
-                            print(f"[{sid}] Found {len(table_elements)} table-like container elements")
-
-                            # Try to find any element with email-like content
-                            all_cells = await page.query_selector_all("[class*='email'], [class*='cell'], [class*='row']")
-                            print(f"[{sid}] Found {len(all_cells)} email/cell/row-like elements")
-                            if all_cells:
-                                print(f"[{sid}] Detected {len(all_cells)} potential data cells")
-                            continue
-                    except Exception as e_debug:
-                        print(f"[{sid}] Error during alternative selector lookup: {str(e_debug)}")
-                    continue # To next designation
+                        await page.wait_for_selector("css=tbody tr", state="attached", timeout=10_000)
+                        print(f"[{sid}] ✓ Rows appeared after retry for '{title_str_item}'.")
+                    except PlaywrightTimeoutError:
+                        print(f"[{sid}] ✗ Still no rows after retry. Skipping '{title_str_item}'.")
+                        continue
 
 
                 if not await _async_wait_all_email_cells_final(page, state, domain_str_item, title_str_item):
@@ -872,7 +1138,10 @@ async def handle_one_job(
                 print(f"[{sid}] Starting final extraction from heap for title '{title_str_item}'. Need {num_of_emails_needed_for_title}. Domain cap (num_results) left: {num_results}. Heap size: {len(max_heap)}")
                 emails_collected_for_this_title_run = 0
                 invalid_email_count = 0
-               
+
+                # Query rows once — re-query only on stale handle error
+                cached_rows = await page.query_selector_all("css=tbody tr")
+
                 while max_heap and emails_collected_for_this_title_run < num_of_emails_needed_for_title and num_results > 0:
                     await check_cancel(state, f"Heap processing loop for {domain_str_item}/{title_str_item}")
 
@@ -880,18 +1149,25 @@ async def handle_one_job(
                         break
                     current_p_val, _, current_row_idx = heapq.heappop(max_heap)
 
-                    # Re-query ALL rows fresh to avoid stale ElementHandle errors
                     try:
-                        fresh_rows = await page.query_selector_all("css=tbody tr")
-                        if current_row_idx >= len(fresh_rows):
-                            print(f"[{sid}]   Row index {current_row_idx} out of range (table has {len(fresh_rows)} rows). Skipping.")
+                        if current_row_idx >= len(cached_rows):
+                            print(f"[{sid}]   Row index {current_row_idx} out of range (table has {len(cached_rows)} rows). Skipping.")
                             continue
-                        current_row_el_handle = fresh_rows[current_row_idx]
-                        if not await current_row_el_handle.is_visible():
+                        current_row_el_handle = cached_rows[current_row_idx]
+                        # Re-query only if handle became stale
+                        try:
+                            visible = await current_row_el_handle.is_visible()
+                        except Exception:
+                            cached_rows = await page.query_selector_all("css=tbody tr")
+                            if current_row_idx >= len(cached_rows):
+                                continue
+                            current_row_el_handle = cached_rows[current_row_idx]
+                            visible = await current_row_el_handle.is_visible()
+                        if not visible:
                             print(f"[{sid}]   Row {current_row_idx} not visible. Skipping.")
                             continue
                     except Exception as e_fresh_query:
-                        print(f"[{sid}]   Could not re-query fresh rows: {e_fresh_query}. Skipping.")
+                        print(f"[{sid}]   Could not get row handle: {e_fresh_query}. Skipping.")
                         continue
 
                     print(f"[{sid}]\n  Processing Row index={current_row_idx} (priority: {current_p_val})")
@@ -957,9 +1233,9 @@ async def handle_one_job(
                         if is_green_or_yellow_email_row and "@" in initial_email_cell_text and "." in initial_email_cell_text \
                            and "Add to list" not in initial_email_cell_text and "No email found" not in initial_email_cell_text:
                             
-                            potential_email_parsed = initial_email_cell_text.split()[-1] if initial_email_cell_text.split() else initial_email_cell_text
-                            if "@" in potential_email_parsed and "." in potential_email_parsed:
-                                final_email_str_from_row = potential_email_parsed
+                            _email_match = _EMAIL_RE.search(initial_email_cell_text)
+                            if _email_match:
+                                final_email_str_from_row = _email_match.group()
                                 print(f"[{sid}]   Direct G/Y email found: {final_email_str_from_row}")
 
                                 # Check if already saved to the target list
@@ -1006,6 +1282,30 @@ async def handle_one_job(
                                                     break
                                             except PlaywrightTimeoutError:
                                                 continue
+
+                                        # Filter via search input and deduplicate
+                                        for dd_search_sel in ["div.pl-select__drop input", "div.pl-select input", ".pl-select__search input"]:
+                                            try:
+                                                dd_search = page.locator(dd_search_sel)
+                                                if await dd_search.count() > 0:
+                                                    await dd_search.first.fill(downloadFileName)
+                                                    await asyncio.sleep(0.4)
+                                                    dropdown_items_list_h = await page.query_selector_all("css=li.pl-select__item")
+                                                    break
+                                            except Exception:
+                                                continue
+                                        seen_gy_texts = set()
+                                        unique_gy_items = []
+                                        for _itm in dropdown_items_list_h:
+                                            try:
+                                                _span = await _itm.query_selector("span.pl-select__item-name, span.item-name, span")
+                                                _txt = (await _span.inner_text()).strip() if _span else (await _itm.inner_text()).strip()
+                                                if _txt not in seen_gy_texts:
+                                                    seen_gy_texts.add(_txt)
+                                                    unique_gy_items.append(_itm)
+                                            except Exception:
+                                                continue
+                                        dropdown_items_list_h = unique_gy_items
 
                                         is_already_ticked_in_list = False
                                         found_target_in_dropdown = False
@@ -1064,77 +1364,93 @@ async def handle_one_job(
                                     print(f"[{sid}]   G/Y email, but no 'Saved' button. State: '{await action_cell_el_h.inner_text() if action_cell_el_h else 'N/A'}'. Will attempt 'Add to list' if necessary.")
                                     final_email_str_from_row = None # Force "Add to list" path if it's not explicitly saved
 
-                        if not final_email_str_from_row: # Needs "Add to list" or email wasn't G/Y
-                            print(f"[{sid}]   Email not G/Y or not directly available ('{initial_email_cell_text}'). Attempting 'Add to list'...")
-                            action_cell_selectors_2 = [
-                                "css=td.row__cell--action",
-                                "css=td[class*='action']",
-                                "xpath=.//td[contains(@class, 'action')]"
-                            ]
-                            action_cell_el_h = await find_element_flexible(current_row_el_handle, action_cell_selectors_2)
-                            add_list_btn_el_h = None
-                            if action_cell_el_h:
-                                add_list_btn_selectors = [
-                                    "xpath=.//button[contains(@class, 'snv-btn') and contains(@class, 'pl-select__top-target') and .//span[contains(text(), 'Add to list')]]",
-                                    "xpath=.//button[.//span[contains(text(), 'Add to list')]]",
-                                    "css=button[class*='snv-btn']:has-text('Add to list')",
-                                    "xpath=.//button[contains(text(), 'Add to list')]"
-                                ]
-                                add_list_btn_el_h = await find_element_flexible(action_cell_el_h, add_list_btn_selectors)
-                            
-                            if add_list_btn_el_h:
-                                print(f"[{sid}]     'Add to list' button identified.")
+                        if not final_email_str_from_row: # Needs "Find Email" (new Snov.io UI)
+                            await current_row_el_handle.scroll_into_view_if_needed()
+                            await asyncio.sleep(0.5)
+
+                            # ── Find Email button (permanent new UI) ──────────────────────────
+                            find_email_btn_el_h = await find_element_flexible(current_row_el_handle, [
+                                "xpath=.//button[.//span[contains(text(),'Find email')]]",
+                                "xpath=.//button[.//span[contains(text(),'Find Email')]]",
+                                "xpath=.//button[contains(text(),'Find email')]",
+                                "xpath=.//button[contains(text(),'Find Email')]",
+                                "css=button:has-text('Find email')",
+                                "css=button:has-text('Find Email')",
+                            ])
+
+                            if find_email_btn_el_h:
+                                print(f"[{sid}]   'Find Email' button found. Clicking...")
                                 try:
-                                    # Use native Playwright click — Vue.js ignores plain JS el.click()
+                                    await find_email_btn_el_h.scroll_into_view_if_needed()
+                                    await find_email_btn_el_h.click(timeout=5000)
+                                except Exception:
+                                    await page.evaluate(
+                                        """el => {
+                                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
+                                                el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
+                                            );
+                                        }""",
+                                        find_email_btn_el_h
+                                    )
+
+                                # ── Wait for list-selection dropdown ──
+                                dropdown_items_fe = []
+                                for dd_sel in [
+                                    "css=li.pl-select__item",
+                                    "css=div.app-dropdown__drop li",
+                                    "css=div.snov-dropdown__options li",
+                                    "css=ul.pl-select__list li",
+                                ]:
                                     try:
-                                        await add_list_btn_el_h.scroll_into_view_if_needed()
-                                        await add_list_btn_el_h.click(timeout=5000)
+                                        await page.wait_for_selector(dd_sel, state="visible", timeout=5_000)
+                                        dropdown_items_fe = await page.query_selector_all(dd_sel)
+                                        if dropdown_items_fe:
+                                            print(f"[{sid}]     Dropdown found ({len(dropdown_items_fe)} items)")
+                                            break
+                                    except PlaywrightTimeoutError:
+                                        continue
+
+                                # ── Filter dropdown via search input if available ──
+                                for dd_search_sel in ["div.pl-select__drop input", "div.pl-select input", ".pl-select__search input"]:
+                                    try:
+                                        dd_search = page.locator(dd_search_sel)
+                                        if await dd_search.count() > 0:
+                                            await dd_search.first.fill(downloadFileName)
+                                            await asyncio.sleep(0.4)
+                                            dropdown_items_fe = await page.query_selector_all("css=li.pl-select__item")
+                                            print(f"[{sid}]     Filtered dropdown to {len(dropdown_items_fe)} item(s)")
+                                            break
                                     except Exception:
-                                        await page.evaluate(
-                                            """el => {
-                                                ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t =>
-                                                    el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
-                                                );
-                                            }""",
-                                            add_list_btn_el_h
-                                        )
+                                        continue
 
-                                    # Wait for dropdown container to appear — don't rely on bare sleep
-                                    dropdown_container_selectors = [
-                                        "css=li.pl-select__item",
-                                        "css=div.app-dropdown__drop li",
-                                        "css=div.snov-dropdown__options li",
-                                        "css=ul.pl-select__list li",
-                                    ]
-                                    dropdown_items_list_h_add = []
-                                    for dd_sel in dropdown_container_selectors:
+                                # ── Deduplicate ──
+                                seen_fe = set()
+                                unique_fe = []
+                                for _i in dropdown_items_fe:
+                                    try:
+                                        _sp = await _i.query_selector("span.pl-select__item-name, span.item-name, span")
+                                        _t = (await _sp.inner_text()).strip() if _sp else (await _i.inner_text()).strip()
+                                        if _t not in seen_fe:
+                                            seen_fe.add(_t)
+                                            unique_fe.append(_i)
+                                    except Exception:
+                                        continue
+                                dropdown_items_fe = unique_fe
+
+                                # ── Click target list ──
+                                clicked_fe = False
+                                if dropdown_items_fe:
+                                    target_lower_fe = downloadFileName.strip().lower()
+                                    for dd_item_fe in dropdown_items_fe:
                                         try:
-                                            await page.wait_for_selector(dd_sel, state="visible", timeout=5_000)
-                                            dropdown_items_list_h_add = await page.query_selector_all(dd_sel)
-                                            if dropdown_items_list_h_add:
-                                                print(f"[{sid}]     Dropdown found via: {dd_sel} ({len(dropdown_items_list_h_add)} items)")
-                                                break
-                                        except PlaywrightTimeoutError:
-                                            continue
-
-                                    clicked_target_list_dd_item_add = False
-
-                                    if dropdown_items_list_h_add:
-                                        target_lower = downloadFileName.strip().lower()
-                                        for dd_item_h_add in dropdown_items_list_h_add:
-                                            # Try multiple selectors for the item name span
-                                            item_name_span = await dd_item_h_add.query_selector(
-                                                "span.pl-select__item-name, span.item-name, span"
-                                            )
-                                            item_text = (await item_name_span.inner_text()).strip() if item_name_span else \
-                                                        (await dd_item_h_add.inner_text()).strip()
-                                            print(f"[{sid}]     Dropdown item: '{item_text}'")
-                                            if item_text.lower() == target_lower:
-                                                print(f"[{sid}]     Found target list '{downloadFileName}'. Clicking.")
-                                                # Dispatch full mouse event chain — Vue.js needs pointerdown/mousedown/mouseup/click
+                                            sp_fe = await dd_item_fe.query_selector("span.pl-select__item-name, span.item-name, span")
+                                            txt_fe = (await sp_fe.inner_text()).strip() if sp_fe else (await dd_item_fe.inner_text()).strip()
+                                            print(f"[{sid}]     Dropdown item: '{txt_fe}'")
+                                            if txt_fe.lower() == target_lower_fe:
+                                                print(f"[{sid}]     Found '{downloadFileName}'. Clicking.")
                                                 try:
-                                                    await dd_item_h_add.scroll_into_view_if_needed()
-                                                    await dd_item_h_add.click(timeout=5000)
+                                                    await dd_item_fe.scroll_into_view_if_needed()
+                                                    await dd_item_fe.click(timeout=5000)
                                                 except Exception:
                                                     await page.evaluate(
                                                         """el => {
@@ -1142,62 +1458,45 @@ async def handle_one_job(
                                                                 el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}))
                                                             );
                                                         }""",
-                                                        dd_item_h_add
+                                                        dd_item_fe
                                                     )
-                                                clicked_target_list_dd_item_add = True
-                                                # Wait for toast confirmation that prospect was saved
-                                                try:
-                                                    toast_sel = "xpath=//div[contains(text(), 'prospects saved') or contains(text(), 'Prospects have been saved') or contains(text(), 'saved to')]"
-                                                    await page.wait_for_selector(toast_sel, state="visible", timeout=7_000)
-                                                    await page.wait_for_selector(toast_sel, state="hidden", timeout=7_000)
-                                                    print(f"[{sid}]     Toast confirmed: prospect saved to list.")
-                                                except PlaywrightTimeoutError:
-                                                    print(f"[{sid}]     No toast seen — proceeding anyway.")
-                                                await asyncio.sleep(0.5)
+                                                clicked_fe = True
                                                 break
-                                        if not clicked_target_list_dd_item_add:
-                                            print(f"[{sid}]     ERROR: Target list '{downloadFileName}' not found in dropdown ('Add to list' path).")
-                                            print(f"[{sid}]     Available lists: {[((await i.query_selector('span.pl-select__item-name, span')) and (await (await i.query_selector('span.pl-select__item-name, span')).inner_text()).strip()) for i in dropdown_items_list_h_add]}")
-                                    else:
-                                        print(f"[{sid}]     ERROR: Dropdown did not appear after clicking 'Add to list'.")
-
-                                    if clicked_target_list_dd_item_add:
-                                        saved_status_text = await _async_wait_button_status_saved(current_row_el_handle, state, domain_str_item, title_str_item)
-                                        stable_email_text_after_add = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item)
-                                        print(f"[{sid}]     Status='{saved_status_text}', Final Email Text='{stable_email_text_after_add}'")
-
-                                        is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
-                                        # Accept email if: valid format AND (verified status OR save was confirmed)
-                                        email_is_valid_format = "@" in stable_email_text_after_add and "." in stable_email_text_after_add and "No email found" not in stable_email_text_after_add
-                                        if email_is_valid_format and (is_green_or_yellow_email_row or "saved" in saved_status_text.lower()):
-                                            final_email_str_from_row = stable_email_text_after_add
-                                            print(f"[{sid}]     Email successfully retrieved via 'Add to list': {final_email_str_from_row}")
-                                        elif email_is_valid_format:
-                                            # Email is valid but status uncertain — still record it
-                                            final_email_str_from_row = stable_email_text_after_add
-                                            print(f"[{sid}]     Email recorded (status uncertain but email valid): {final_email_str_from_row}")
-                                        else:
-                                            print(f"[{sid}]     Email after 'Add to list' ('{stable_email_text_after_add}') not valid or 'No email found'.")
-                                    else: # Target list not clicked
-                                        if await page.query_selector("div.app-dropdown__drop, div.snov-dropdown__options"): # If dropdown is open
-                                            await page.keyboard.press("Escape")
-
-                                except Exception as e_add_to_list_flow:
-                                    print(f"[{sid}]     Error during 'Add to list' flow: {e_add_to_list_flow}")
-                                    if await page.query_selector("div.app-dropdown__drop, div.snov-dropdown__options"): # If dropdown is open
-                                        await page.keyboard.press("Escape")
-                            elif action_cell_el_h and "Saved" in (await action_cell_el_h.inner_text()):
-                                
-                                stable_email_text_if_saved = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item, timeout_s=10) # Shorter timeout
-                                is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
-                                email_valid = "@" in stable_email_text_if_saved and "." in stable_email_text_if_saved and "No email found" not in stable_email_text_if_saved
-                                if email_valid:
-                                    final_email_str_from_row = stable_email_text_if_saved
-                                    print(f"[{sid}]     Email confirmed from 'Saved' row: {final_email_str_from_row}")
+                                        except Exception:
+                                            continue
+                                    if not clicked_fe:
+                                        print(f"[{sid}]     ERROR: List '{downloadFileName}' not found in Find Email dropdown.")
                                 else:
-                                    print(f"[{sid}]   Button was 'Saved', but email text ('{stable_email_text_if_saved}') not valid or 'No email found'.")
+                                    print(f"[{sid}]     No dropdown appeared after Find Email click.")
+
+                                await page.keyboard.press("Escape")
+
+                                if clicked_fe:
+                                    # ── Wait for email to appear in cell ──
+                                    print(f"[{sid}]   Waiting for email after 'Find Email'...")
+                                    saved_status_text = await _async_wait_button_status_saved(current_row_el_handle, state, domain_str_item, title_str_item)
+                                    stable_email_text_after_add = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item)
+                                    print(f"[{sid}]     Status='{saved_status_text}', Email='{stable_email_text_after_add}'")
+                                    is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
+                                    email_valid_fe = "@" in stable_email_text_after_add and "." in stable_email_text_after_add and "No email found" not in stable_email_text_after_add
+                                    if email_valid_fe:
+                                        final_email_str_from_row = stable_email_text_after_add
+                                        print(f"[{sid}]   ✅ Email via 'Find Email': {final_email_str_from_row}")
+                                    else:
+                                        print(f"[{sid}]   'Find Email' result: '{stable_email_text_after_add}' — not valid.")
                             else:
-                                print(f"[{sid}]   No 'Add to list' button found, or other state. Action cell: '{await action_cell_el_h.inner_text() if action_cell_el_h else 'N/A'}'")
+                                # Row already saved (Saved button visible) — read email directly
+                                action_cell_chk = await find_element_flexible(current_row_el_handle, [
+                                    "css=td.row__cell--action", "css=td[class*='action']", "xpath=.//td[contains(@class,'action')]"
+                                ])
+                                if action_cell_chk and "Saved" in (await action_cell_chk.inner_text()):
+                                    stable_email_text_if_saved = await _async_wait_stable_email_text_in_cell(email_cell_el_h_current, state, domain_str_item, title_str_item, timeout_s=10)
+                                    is_green_or_yellow_email_row = bool(await current_row_el_handle.query_selector(gy_selector))
+                                    if "@" in stable_email_text_if_saved and "No email found" not in stable_email_text_if_saved:
+                                        final_email_str_from_row = stable_email_text_if_saved
+                                        print(f"[{sid}]   Email from already-Saved row: {final_email_str_from_row}")
+                                else:
+                                    print(f"[{sid}]   No 'Find Email' button found for row. Skipping.")
 
                     except MySpecialError: raise
                     except PlaywrightTimeoutError as pte_heap_row_proc:
@@ -1230,16 +1529,7 @@ async def handle_one_job(
                             "domain": domain_str_item
                         }
                         file_data.append(email_record)
-
-                        # ✅ EMIT PREVIEW DATA IN REAL-TIME
-                        try:
-                            state["preview_list"].append(email_record)
-                            socketio.emit("preview_data", {"previewData": state["preview_list"]}, room=sid)
-                            print(f"[{sid}]   ✅ Emitted preview_data. Total items in preview: {len(state['preview_list'])}")
-                        except Exception as e_emit_preview:
-                            print(f"[{sid}]   ⚠️ Error emitting preview_data: {e_emit_preview}")
-
-                        print(f"[{sid}]   Record added. Email count for '{title_str_item}': {emails_collected_for_this_title_run}/{num_of_emails_needed_for_title}. Domain cap (num_results) left: {num_results}")
+                        print(f"[{sid}]   ✅ Email saved. Count for '{title_str_item}': {emails_collected_for_this_title_run}/{num_of_emails_needed_for_title}. Domain cap left: {num_results}")
                     else:
                         invalid_email_count += 1
                         print(f"[{sid}]   No valid G/Y email found for this row after all attempts. Skipping record add.")
@@ -1262,10 +1552,7 @@ async def handle_one_job(
                             # Check if this domain already has a "Not found" entry from this path
                             if not any(fd2_item['domain'] == domain_str_item and "Not found (heap path)" in fd2_item['email'] for fd2_item in file_data2):
                                 print(f"[{sid}]     Heap: Last designation, no G/Y email from heap yet for domain '{domain_str_item}'. Adding to file_data2.")
-                                heap_nf_rec = {
-                                    "First Name": str(not_found_record_id), "job title": "N/A", "company": "N/A",
-                                    "location": "N/A", "email": "Not found (heap path)", "domain": domain_str_item
-                                }
+                                heap_nf_rec = _not_found_record(not_found_record_id, domain_str_item, "Not found (heap path)")
                                 file_data2.append(heap_nf_rec)
                                 not_found_record_id += 1
                                 state["preview_list"].append(heap_nf_rec)
@@ -1277,14 +1564,55 @@ async def handle_one_job(
                 await check_cancel(state, f"Finished heap for {domain_str_item}/{title_str_item}")
                 print(f"[{sid}]\nFinished processing rows for title '{title_str_item}'. Total G/Y emails for this title run: {emails_collected_for_this_title_run}")
             
+            # ── Fallback: domain-search generic contacts if quota not met ──
+            if num_results > 0:
+                socketio.emit("progress_update", {"domain": domain_str_item, "message": f"Quota not met ({num_results} still needed). Trying generic-contact fallback..."}, room=sid)
+                fallback_records = await _async_domain_search_fallback(
+                    page, domain_str_item, downloadFileName, num_results, state, sid
+                )
+                for fb_rec in fallback_records:
+                    file_data.append(fb_rec)
+                    emailcount += 1
+                    found_flag_domain = True
+                    num_results -= 1
+                    socketio.emit("progress_update", {"domain": domain_str_item, "message": f"FALLBACK EMAIL FOUND - {fb_rec['email']}"}, room=sid)
+                # Navigate back so next domain's company-filter setup works
+                await human_delay(2.0, 4.0)  # settle on domain-search before leaving
+                try:
+                    await page.goto("https://app.snov.io/database-search/prospects")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=25_000)
+                    except PlaywrightTimeoutError:
+                        await asyncio.sleep(5)
+                    await human_delay(2.0, 3.5)
+                    current_url = page.url
+                    if "database-search" not in current_url:
+                        print(f"[{sid}] ⚠️ Not on database-search after fallback ({current_url}). Retrying...")
+                        await page.goto("https://app.snov.io/database-search/prospects")
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=20_000)
+                        except PlaywrightTimeoutError:
+                            await asyncio.sleep(4)
+                        await human_delay(1.5, 2.5)
+                    print(f"[{sid}] ✅ Back on database-search after fallback. URL: {page.url}")
+                except PlaywrightError as e_nav_back:
+                    print(f"[{sid}] ⚠️ Page closed during fallback return navigation: {e_nav_back}. Creating fresh page...")
+                    try:
+                        page = await context.new_page()
+                        state["current_page"] = page
+                        await page.goto("https://app.snov.io/database-search/prospects")
+                        await page.wait_for_load_state("networkidle", timeout=20_000)
+                        await human_delay(2.0, 3.0)
+                        print(f"[{sid}] ✅ Recovered with fresh page after fallback crash.")
+                    except Exception as e_recovery:
+                        raise MySpecialError(f"Could not recover page after fallback: {e_recovery}")
+                await check_cancel(state, f"Returned to prospects page after fallback for {domain_str_item}")
+
             # After all designations for a domain
             if not found_flag_domain: # If NO email of any kind was found for this domain
                 print(f"[{sid}] No emails found for domain '{domain_str_item}' after all designations. Adding to file_data2.")
                 if not any(fd2_item['domain'] == domain_str_item and "Not found" in fd2_item['email'] for fd2_item in file_data2): # Avoid duplicates
-                    domain_nf_rec = {
-                        "First Name": str(not_found_record_id), "job title": "N/A", "company": "N/A",
-                        "location": "N/A", "email": "Not found (domain level)", "domain": domain_str_item
-                    }
+                    domain_nf_rec = _not_found_record(not_found_record_id, domain_str_item, "Not found (domain level)")
                     file_data2.append(domain_nf_rec)
                     not_found_record_id += 1
                     state["preview_list"].append(domain_nf_rec)
